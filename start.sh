@@ -97,6 +97,7 @@ PLE_OFFLOAD="${PLE_OFFLOAD:-false}"
 MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-data}"
 EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
+export VLLM_API_KEY="${VLLM_API_KEY:-}"
 HF_TOKEN="${HF_TOKEN:-}"
 # Weight distribution. false (default) = each node keeps its own ~/.cache/huggingface
 # copy, worker seeded by rsync from the head. true = head exports its cache over NFS
@@ -146,6 +147,15 @@ MTP_DRAFT_VOCAB="${MTP_DRAFT_VOCAB:-}"
 QSA_PROFILE="${QSA_PROFILE:-stock}"
 # Refuse to launch when another process already holds the GPU (both nodes).
 REQUIRE_IDLE_GPU="${REQUIRE_IDLE_GPU:-true}"
+
+SPOOLCACHE_ENABLE="${SPOOLCACHE_ENABLE:-0}"
+SPOOLCACHE_MAX_SIZE="${SPOOLCACHE_MAX_SIZE:-200}"
+[[ "$SPOOLCACHE_ENABLE" == "0" || "$SPOOLCACHE_ENABLE" == "1" ]] || err "SPOOLCACHE_ENABLE must be 0 or 1"
+case "${SPOOLCACHE_PATH:-}" in
+    "") spoolcache_head_path="$HOME/.cache/spoolcache" ;;
+    /*) spoolcache_head_path="$SPOOLCACHE_PATH" ;;
+    *) err "SPOOLCACHE_PATH must be absolute" ;;
+esac
 
 # YaRN only makes sense ABOVE the native 262144 context. At or below native,
 # rope scaling degrades quality for zero benefit — force it off.
@@ -618,6 +628,42 @@ if $DO_LAUNCH; then
         ok "Image already on worker."
     fi
 
+    SPOOLCACHE_HEAD_DOCKER_ARGS=""; SPOOLCACHE_WORKER_DOCKER_ARGS=""; SPOOLCACHE_VLLM_ARG=""
+    if [[ "$SPOOLCACHE_ENABLE" == "1" ]]; then
+        info "=== Step 5a: Prepare SpoolCache connector ==="
+
+        spoolcache_worker_path="${SPOOLCACHE_PATH:-$REMOTE_HOME/.cache/spoolcache}"
+        mkdir -p "$spoolcache_head_path"
+        head_image="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+        worker_image="$(ssh_worker "docker image inspect --format '{{.Id}}' '$IMAGE'")"
+        [[ "$head_image" == "$worker_image" ]] || err "SpoolCache runtime images differ between hosts"
+        IMAGE="$head_image"
+        spoolcache_wheel="$(realpath -e "${SPOOLCACHE_WHEEL:-files/spoolcache-0.3.0-py3-none-any.whl}")" || err "Set SPOOLCACHE_WHEEL to a SpoolCache release wheel"
+        [[ "$spoolcache_wheel" == *-py3-none-any.whl ]] || err "SpoolCache requires a pure-Python wheel"
+        wheel_digest="$(sha256sum "$spoolcache_wheel" | cut -d ' ' -f1)"
+        spoolcache_runtime="$HOME/.cache/spoolcache-runtime/$wheel_digest"
+        spoolcache_worker_runtime="$REMOTE_HOME/.cache/spoolcache-runtime/$wheel_digest"
+        mkdir -p "$spoolcache_runtime"
+        cp "$spoolcache_wheel" "$spoolcache_runtime/release.whl"
+        python3 -m zipfile -e "$spoolcache_runtime/release.whl" "$spoolcache_runtime/package"
+        ssh_worker "mkdir -p '$spoolcache_worker_runtime'"
+        scp "$spoolcache_runtime/release.whl" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:$spoolcache_worker_runtime/release.whl"
+        ssh_worker "echo '$wheel_digest  $spoolcache_worker_runtime/release.whl' | sha256sum -c - && python3 -m zipfile -e '$spoolcache_worker_runtime/release.whl' '$spoolcache_worker_runtime/package'"
+        ssh_worker "mkdir -p '$spoolcache_worker_path'"
+
+        SPOOLCACHE_KV_CONFIG="$(
+            docker run --rm \
+                -v "$spoolcache_runtime/package:/opt/spoolcache:ro" -e PYTHONPATH=/opt/spoolcache \
+                -e SPOOLCACHE_PATH=/var/lib/spoolcache \
+                -e SPOOLCACHE_MAX_SIZE="$SPOOLCACHE_MAX_SIZE" \
+                --entrypoint python3 "$IMAGE" -c 'from spoolcache.maintenance import main; main(["config"])'
+        )"
+
+        SPOOLCACHE_HEAD_DOCKER_ARGS="-e PYTHONPATH=/opt/spoolcache -v $spoolcache_runtime/package:/opt/spoolcache:ro -e PYTORCH_CUDA_ALLOC_CONF= -e PYTORCH_ALLOC_CONF= -v $spoolcache_head_path:/var/lib/spoolcache"
+        SPOOLCACHE_WORKER_DOCKER_ARGS="-e PYTHONPATH=/opt/spoolcache -v $spoolcache_worker_runtime/package:/opt/spoolcache:ro -e PYTORCH_CUDA_ALLOC_CONF= -e PYTORCH_ALLOC_CONF= -v $spoolcache_worker_path:/var/lib/spoolcache"
+        SPOOLCACHE_VLLM_ARG="--kv-transfer-config '$SPOOLCACHE_KV_CONFIG'"
+    fi
+
     # ---------------------------------------------------------------------------
     # 6. Prepare the PLE patch
     #    Mixed-quant NVFP4 checkpoints declare ple_embedding_dtype in config:
@@ -690,6 +736,7 @@ if $DO_LAUNCH; then
 
     VLLM_ARGS=()
     VLLM_ARGS+=("--served-model-name" "$SERVED_MODEL_NAME")
+    [[ "$SPOOLCACHE_ENABLE" == "1" ]] && VLLM_ARGS+=("--revision" "$SNAP")
     VLLM_ARGS+=("--tensor-parallel-size" "$TENSOR_PARALLEL_SIZE")
     VLLM_ARGS+=("--gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION")
     VLLM_ARGS+=("--max-num-seqs" "$MAX_NUM_SEQS")
@@ -919,11 +966,13 @@ docker run \
     $OVERLAY_ENV_STR \
     $WORKER_HF_MOUNT \
     -v $REMOTE_HOME/.cache/vllm:/root/.cache/vllm \
+    $SPOOLCACHE_WORKER_DOCKER_ARGS \
     $IMAGE \
     $MODEL_ID \
     $VLLM_ARGS_STR \
     --node-rank 1 \
-    --headless
+    --headless \
+    $SPOOLCACHE_VLLM_ARG
 LAUNCH_EOF
     # No chmod here on purpose: mktemp already creates the file 0600. What used
     # to be `chmod +x` *loosened* that to 0711 under every umask below 077, and
@@ -971,6 +1020,7 @@ docker run \
     -e NCCL_DEBUG=WARN \
     -e HF_HUB_OFFLINE=1 \
     -e TRANSFORMERS_OFFLINE=1 \
+    -e VLLM_API_KEY \
     -e VLLM_HOST_IP=$HEAD_IP \
     ${VLLM_ALLOW_LONG_MAX_MODEL_LEN:+-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=$VLLM_ALLOW_LONG_MAX_MODEL_LEN} \
     $PLE_OFFLOAD_ENV \
@@ -981,12 +1031,14 @@ docker run \
     $OVERLAY_ENV_STR \
     -v $HF_CACHE_DIR:/root/.cache/huggingface \
     -v $HOME/.cache/vllm:/root/.cache/vllm \
+    $SPOOLCACHE_HEAD_DOCKER_ARGS \
     $IMAGE \
     $MODEL_ID \
     $VLLM_ARGS_STR \
     --node-rank 0 \
     --host 0.0.0.0 \
-    --port $PORT
+    --port $PORT \
+    $SPOOLCACHE_VLLM_ARG
 LAUNCH_EOF
     # Same reasoning as the worker script above: mktemp's 0600 is already right,
     # so no chmod. The inspection copy below does need one — `cp` onto an
